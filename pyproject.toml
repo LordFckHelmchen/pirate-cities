@@ -1,0 +1,67 @@
+[project]
+name = "pirate-cities"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pandas==2.3.2",
+    "numpy==2.3.3",
+]
+
+[dependency-groups]
+dev = [
+    "plotly==6.3.0",
+    "pytest==8.4.2",
+]
+
+[project.scripts]
+pirates = "pirate_cities.main:main"
+
+[build-system]
+requires = ["uv_build>=0.8.13"]
+build-backend = "uv_build"
+
+[tool.ruff]
+# Via pre-commit
+line-length = 120
+
+[tool.ruff.lint]
+ignore = [
+    "AIR",     # All airflow warnings
+    "ANN002",  # Missing function annotation for *args
+    "ANN003",  # Missing function annotation for **kwargs
+    "ANN10",   # No annotation for self/cls - not useful
+    "ANN401",  # Dynamically typed expressions are disallowed - disabled by the plug-in itself
+    "D",       # All pydocstyle warnings
+    "DJ",      # All django warnings
+    "FAST",    # All fastapi warnings
+    "G004",    # Logging statement uses f-string
+    "ISC001",  # Ignored to avoid conflicts with 'ruff format'
+    "S311",    # Standard pseudo-random generators are not used for security/cryptography
+    "TD",      # We don't allow TODO comments (even not with a ticket number)
+    "E501",    # TEMPORARY (during development): Line too long
+    "ERA001",  # TEMPORARY (during development): Allow commenting out code
+    "FIX",     # TEMPORARY (during development): Allow TODO comments
+    ]
+select = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = [
+    "T201",    # Allow print output in main program
+    ]
+"test_*.py" = [
+    "ANN201",  # No return type check for tests
+    "SLF",     # Allow private member access in tests
+    "S101",    # Allow use of assert in tests
+    "T201",    # Allow print output in tests
+    ]
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
