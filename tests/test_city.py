@@ -2,6 +2,7 @@ import copy
 
 from pirate_cities.city import CITY_INFORMATION_PRICE_IN_GOLD
 from pirate_cities.city import City
+from pirate_cities.point2d import Point2d
 from pirate_cities.resource import ResourceName
 
 
@@ -9,7 +10,7 @@ def test_init_assigns_name_resources_and_gold() -> None:
     expected_city_name = "Shity"
     expected_gold = 100
     expected_resources = {resource: i * 10 for i, resource in enumerate(ResourceName)}
-    city = City(expected_city_name, gold=expected_gold, **expected_resources)
+    city = City(expected_city_name, location=Point2d(1, 2), gold=expected_gold, **expected_resources)
 
     assert city.name == expected_city_name
     assert city.gold == expected_gold
@@ -21,8 +22,8 @@ def test_init_assigns_name_resources_and_gold() -> None:
 
 
 def test_update_market_info_adds_city_itself_and_returns_price() -> None:
-    some_city = City("Some City")
-    other_city_info = City("Other City")
+    some_city = City("Some City", location=Point2d(1, 2))
+    other_city_info = City("Other City", location=Point2d(3, 4))
 
     # city_a receives info about city_b (should add it)
     price = some_city.buy_city_info(other_city_info)
@@ -35,15 +36,17 @@ def test_update_market_info_adds_city_itself_and_returns_price() -> None:
 def test_update_market_info_updates_only_newer_info() -> None:
     initial_recency = 0
     updated_recency = 5
-    other_city_info = City("Old City Info", recency_in_iterations=initial_recency)
+    other_city_info = City("Old City Info", location=Point2d(1, 2), recency_in_iterations=initial_recency)
     destination_city_info = City(
         "New City Info",
+        location=Point2d(3, 4),
         recency_in_iterations=initial_recency,
         information={"Old City Info": copy.deepcopy(other_city_info)},
     )
 
     some_city = City(
         "Some City",
+        location=Point2d(5, 6),
         information={
             "Old City Info": copy.deepcopy(other_city_info),
             "New City Info": copy.deepcopy(destination_city_info),

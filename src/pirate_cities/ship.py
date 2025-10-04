@@ -1,4 +1,5 @@
 import logging
+import math
 import random
 from collections.abc import Generator
 from copy import copy
@@ -7,9 +8,10 @@ from enum import Enum
 from enum import IntEnum
 from typing import Self
 
-import numpy as np
-
 from .city import City
+from .config import MIN_SHIP_SPEED_IN_KM_PER_DAY
+from .config import MOVABLE_CARGO_RANGE_IN_TONS_PER_DAY
+from .point2d import Point2d
 from .resource import ResourceName
 
 # French Heritage
@@ -110,11 +112,11 @@ SHIP_NAMES = FRENCH_SHIP_NAMES + DUTCH_SHIP_NAMES + SPANISH_SHIP_NAMES + ENGLISH
 class ShipSpeed(IntEnum):
     """Speed of the ship in km per iteration."""
 
-    VERY_SLOW = 100
-    SLOW = 200
-    MODERATE = 300
-    FAST = 400
-    VERY_FAST = 500
+    VERY_SLOW = MIN_SHIP_SPEED_IN_KM_PER_DAY
+    SLOW = 2 * MIN_SHIP_SPEED_IN_KM_PER_DAY
+    MODERATE = 3 * MIN_SHIP_SPEED_IN_KM_PER_DAY
+    FAST = 4 * MIN_SHIP_SPEED_IN_KM_PER_DAY
+    VERY_FAST = 5 * MIN_SHIP_SPEED_IN_KM_PER_DAY
 
 
 class ShipType(Enum):
@@ -222,27 +224,40 @@ class ShipSpec:
                 raise ValueError(msg)
 
 
+class ShipState(Enum):
+    AT_SEA = "At Sea"
+    ARRIVED_AT_PORT = "Arrived at Port"
+    WAITING_FOR_DEPARTURE = "Waiting for Departure"
+
+
 class Ship:
     def __init__(
         self,
         name: str,
-        start: City,
-        destination: City,
         ship_type: ShipType,
+        start: City,
+        route: list[City],
+        agenda: dict[str, dict] | None = None,
     ) -> None:
         self.name = name
         self._ship_spec = ShipSpec.from_type(ship_type)
 
-        # Set by according properties/functions
-        self._destination = destination
-        self._has_arrived = False
-        self.cargo = dict.fromkeys(ResourceName, 0)
-        self.gold = 0
-
-        self.start = start
-
+        self._sold_cargo: dict[ResourceName, int] = None
+        self._cargo: dict[ResourceName, int] = None
+        self._gold = None
         self.clear_cargo()
-        self.depart(destination)
+
+        self._start = start
+        self._route: list[City] = None
+        self._agenda: dict[str, dict] = None
+        self._current_stop_index = None
+        self.set_itinerary(start, route, agenda)
+
+        self._location = copy(start.location)
+        self._state = ShipState.WAITING_FOR_DEPARTURE
+        self._waiting_iterations_remaining = 0
+
+        # Do not automatically depart on construction; allow tests and callers to control first departure
 
     @property
     def ship_spec(self) -> ShipSpec:
@@ -254,58 +269,82 @@ class Ship:
         return self._destination
 
     @property
+    def current_location(self) -> Point2d:
+        return self._location
+
+    @property
     def iterations_en_route(self) -> int:
         return self._iterations_en_route
 
-    def set_new_destination(self, new_destination: City) -> None:
-        """Set a new destination for the ship and mark it as not having arrived."""
-        self._destination = new_destination
-        self._has_arrived = False
-        self._iterations_en_route = 0
+    def set_itinerary(self, start: City, route: list[City], agenda: dict[str, dict]) -> None:
+        """Set a multi-stop route (excluding home) and an optional agenda per city.
+
+        Example agenda: {"Port Royal": {"sell": {ResourceName.FOOD: None}, "buy": {ResourceName.GOODS: 10}}}
+        """
+        self._route = route
+        if route[-1] != start:
+            self._route.append(start)  # Ensure we return home at end of route
+        self._agenda = agenda
+        self._current_stop_index = 0
+
+        # Initialize next destination so the ship has a valid destination before first depart
+        self._destination = self._route[self._current_stop_index]
 
     def clear_cargo(self) -> None:
         """Clear the cargo of the ship."""
-        self.cargo = dict.fromkeys(ResourceName, 0)
-        self.gold = 0
+        self._sold_cargo = dict.fromkeys(ResourceName, 0)
+        self._cargo = dict.fromkeys(ResourceName, 0)
+        self._gold = 0
 
-    def depart(self, destination: City) -> None:
-        self.set_new_destination(destination)
-        # TODO: Use the information from the current location to set the info
+    def _depart(self) -> None:
+        # If currently on the way do nothing.
+        if self._state != ShipState.WAITING_FOR_DEPARTURE:
+            return
+
+        # If currently waiting at a port, do not depart until waiting is done
+        if self._waiting_iterations_remaining > 0:
+            self._waiting_iterations_remaining -= 1
+            return
+
+        # Pick next stop
+        self._destination = self._route[self._current_stop_index] if self._route else self._start
+        self._state = ShipState.AT_SEA
+        self._iterations_en_route = 0
+
+        # Update cached info snapshots
         self.destination_info = copy(self.destination)
-        self.owner_info = copy(self.start)
+        self.owner_info = copy(self._start)
 
-        # Record prices, population, and fill cargo with what owner city wants to sell
-        self.load_cargo_to_sell()
+        # Load initial cargo to sell based on owner's excess supply
+        self._load_cargo_to_sell()
 
-        self.location = copy(self.start.location)
+    # Do not forcibly reset the ship's location here; it should continue from current position
 
     @property
     def has_arrived(self) -> bool:
         """Check if the ship has arrived at its destination."""
-        return self._has_arrived
+        return self._state == ShipState.ARRIVED_AT_PORT
 
-    def travel(self) -> None:
+    def _travel(self) -> None:
         """Travel one iteration towards the destination city."""
-        # Calculate the distance to the destination
+        if self._state != ShipState.AT_SEA:
+            return
+
         self._iterations_en_route += 1
-        dest_loc = np.array(self.destination.location)
-        self_loc = np.array(self.location)
+
+        # Calculate the distance to the destination
+        dest_loc = self.destination.location
         if (
-            distance := np.linalg.norm(dest_loc - self_loc)
+            distance := self._location.distance_to(dest_loc)
         ) > self._ship_spec.speed:  # Check if we can't reach the destination in this iteration
             # Move towards the destination
-            direction = (dest_loc - self_loc) / distance
-            self_loc += direction * self._ship_spec.speed
-            self.location = tuple(self_loc)
-        else:
-            self._has_arrived = True
-            # If the ship is close enough, it arrives at the destination, sells any cargo for the price at the
-            # destination, loads the gold and travels back to the start City to hand over the gold.
-            self.location = self.destination.location
-            if self.location == self.start.location:
-                self.arrive_home()
-            else:
-                self.arrive_at_destination()
+            direction = dest_loc - self._location
+            self._location += direction * (self._ship_spec.speed / distance)
+        else:  # Close enough to destination
+            # Copy the city's location so the ship does not hold a reference to the same Point2d
+            self._location = copy(self.destination.location)
+            # The ship arrives at the destination
+            self._state = ShipState.ARRIVED_AT_PORT
 
     def get_resource_names_ordered_by_margin(self) -> Generator[ResourceName]:
         """Sort resources by the margin between the current destination and past owner prices & return highest first."""
@@ -318,30 +357,140 @@ class Ship:
         yield from sorted(margins, key=margins.get, reverse=True)  # Highest first
 
     @property
-    def loaded_cargo_in_tons(self) -> float:
+    def total_cargo_in_tons(self) -> float:
         """Calculate the total cargo loaded in tons."""
-        return sum(self.cargo.values())
+        return sum(self._cargo.values())
 
-    def load_cargo_to_sell(self) -> None:
+    def _load_cargo_to_sell(self) -> None:
         # Decide what and how much to sell (e.g., excess resources)
-        excesses = {resource: self.start.excess_supply(resource) for resource in ResourceName}
+        excesses = {resource: self._start.excess_supply(resource) for resource in ResourceName}
         # TODO: Load cargo with highest margin at destination first
         for resource, excess_supply_in_tons in sorted(
             excesses.items(),
             key=lambda x: x[1],
             reverse=True,
         ):  # Sort by excess supply; highest first
-            remaining_cargo_hold_in_tons = self._ship_spec.max_cargo_hold_in_tons - self.loaded_cargo_in_tons
+            remaining_cargo_hold_in_tons = self._ship_spec.max_cargo_hold_in_tons - self.total_cargo_in_tons
             if remaining_cargo_hold_in_tons <= 0 or excess_supply_in_tons <= 0:
                 break
 
-            self.cargo[resource] = int(
+            self._cargo[resource] = int(
                 min(excess_supply_in_tons, remaining_cargo_hold_in_tons),
             )
-            self.start[resource] -= self.cargo[resource]
+            self._start[resource] -= self._cargo[resource]
 
-        self.gold = int(0.3 * random.random() * self.start.gold)
-        self.start.gold -= self.gold
+        self._gold = int(0.3 * random.random() * self._start.gold)
+        self._start.gold -= self._gold
+
+    def _handle_arrival(self) -> None:
+        """Process arrival at the current destination: update info, perform agenda sell/buy and set next destination."""
+        if self._state != ShipState.ARRIVED_AT_PORT:
+            return
+
+        # Update snapshot information
+        self.destination_info = copy(self.destination)
+        self.owner_info = copy(self._start)
+
+        # If arrived home, process return
+        if self._location == self._start.location:
+            self._arrive_home()
+            # no further route required
+            self._waiting_iterations_remaining = 0
+            return
+
+        # Process sells/buys according to agenda for this city
+        city_name = self.destination.name
+
+        # Snapshot cargo before actions to compute moved tons
+        cargo_before = copy(self._cargo)
+
+        self._sold_cargo = dict.fromkeys(ResourceName, 0)
+        # Sell per agenda; if no agenda provided, fall back to existing behavior
+        if city_name in self._agenda and "sell" in self._agenda[city_name]:
+            self._sell_per_agenda(city_name)
+        else:
+            # default: sell based on margins
+            self._sell_cargo_at_destination()
+
+        # Buy per agenda (only if agenda instructs buying at this city)
+        if city_name in self._agenda and "buy" in self._agenda[city_name]:
+            self._buy_per_agenda(city_name)
+        else:
+            # Default: opportunistic buying based on owner's demand
+            self._buy_cargo_at_destination()
+
+        # The destination may pay for info
+        self._gold += self.destination.buy_city_info(self.owner_info)
+
+        # Snapshot cargo after actions and compute moved tons (sold + bought)
+        total_cargo_moved_in_tons = sum(abs(self._cargo[r] - cargo_before[r]) for r in ResourceName)
+
+        # Get random waiting time based on movable cargo range per day
+        movable_cargo_in_tons_per_day = random.uniform(*MOVABLE_CARGO_RANGE_IN_TONS_PER_DAY)
+        # Wait at least 1 day if cargo was moved
+        self._waiting_iterations_remaining = math.ceil(total_cargo_moved_in_tons / movable_cargo_in_tons_per_day)
+        self._state = ShipState.WAITING_FOR_DEPARTURE
+
+        # Set next destination: advance in route or return home
+        if self._current_stop_index < len(self._route):
+            # move to next stop index (we just arrived at route[_current_stop_index])
+            self._current_stop_index += 1
+        # determine the next city to go to (if any left, otherwise return home)
+        if self._current_stop_index < len(self._route):
+            self._destination = self._route[self._current_stop_index]
+        else:
+            self._destination = self._start
+
+    def _sell_per_agenda(self, city_name: str) -> None:
+        """Sell resources at this city according to the owner's agenda."""
+        orders = self._agenda.get(city_name, {}).get("sell", {})
+        for resource, amount in orders.items():
+            available = self._cargo.get(resource, 0)
+            if available <= 0:
+                continue
+            to_sell = available if amount is None else int(min(available, amount))
+            price = self.destination.price(resource)
+            earnings = to_sell * price
+            # perform sale limited by city gold
+            actual_earnings = min(earnings, self.destination.gold)
+            actual_sold = int(actual_earnings / price) if price > 0 else 0
+            self._cargo[resource] -= actual_sold
+            self.destination[resource] += actual_sold
+            self._gold += actual_sold * price
+            self.destination.gold -= actual_sold * price
+            self._sold_cargo[resource] = actual_sold
+
+    def _buy_per_agenda(self, city_name: str) -> None:
+        """Buy resources at this city according to agenda, preferring to buy here if price is cheapest among remaining stops."""
+        orders = self._agenda.get(city_name, {}).get("buy", {})
+        # Determine remaining stops (this city included and future route stops)
+        remaining_cities = [self.destination, *self._route[self._current_stop_index + 1 :]]
+        for resource, target_amount in orders.items():
+            # how much already on board
+            already = self._cargo.get(resource, 0)
+            need = float("inf") if target_amount is None else max(0, int(target_amount) - already)
+            if need <= 0:
+                continue
+            # compute cheapest future price among remaining_cities
+            future_prices = [c.price(resource) for c in remaining_cities if c is not None]
+            min_future_price = min(future_prices) if future_prices else self.destination.price(resource)
+            current_price = self.destination.price(resource)
+            # If current city is cheapest (ties included), buy here up to need, capacity, gold, and supplier
+            if current_price <= min_future_price:
+                remaining_capacity = int(self._ship_spec.max_cargo_hold_in_tons - self.total_cargo_in_tons)
+                if remaining_capacity <= 0:
+                    break
+                supplier = self.destination.excess_supply(resource)
+                amount_available = int(
+                    min(need if need != float("inf") else remaining_capacity, supplier, remaining_capacity),
+                )
+                max_affordable = int(self._gold // current_price) if current_price > 0 else 0
+                buy_amount = int(min(amount_available, max_affordable))
+                if buy_amount <= 0:
+                    continue
+                self._cargo[resource] += buy_amount
+                self._gold -= buy_amount * current_price
+                self.destination[resource] -= buy_amount
 
     @property
     def cargo_to_buy(self) -> Generator[tuple[ResourceName, float]]:
@@ -355,31 +504,31 @@ class Ship:
         # Sort by demand; highest first & filter out zero demands
         yield from sorted(demands.items(), key=lambda x: x[1], reverse=True)
 
-    def sell_cargo_at_destination(self) -> None:
+    def _sell_cargo_at_destination(self) -> None:
         """Sell cargo at destination with the best margin first."""
         for resource in self.get_resource_names_ordered_by_margin():
             price_in_gold_per_ton = self.destination.price(
                 resource,
             )  # Current price at destination
             earnings_in_gold = min(
-                self.cargo[resource] * price_in_gold_per_ton,
+                self._cargo[resource] * price_in_gold_per_ton,
                 self.destination.gold,
             )
             cargo_sold_in_tons = int(earnings_in_gold / price_in_gold_per_ton)
             earnings_in_gold = cargo_sold_in_tons * price_in_gold_per_ton
-            self.cargo[resource] -= cargo_sold_in_tons
+            self._cargo[resource] -= cargo_sold_in_tons
             self.destination[resource] += cargo_sold_in_tons
-            self.gold += earnings_in_gold
+            self._gold += earnings_in_gold
             self.destination.gold -= earnings_in_gold
 
-    def buy_cargo_at_destination(self) -> None:
+    def _buy_cargo_at_destination(self) -> None:
         """Buy cargo at destination with the best margin first."""
         for resource, amount_in_tons in self.cargo_to_buy:
-            remaining_cargo_hold_in_tons = self._ship_spec.max_cargo_hold_in_tons - self.loaded_cargo_in_tons
+            remaining_cargo_hold_in_tons = self._ship_spec.max_cargo_hold_in_tons - self.total_cargo_in_tons
             if remaining_cargo_hold_in_tons <= 0:
                 logging.getLogger(__name__).debug(f"Ship {self.name} cannot buy more cargo: full.")
                 break
-            if self.gold <= 0:
+            if self._gold <= 0:
                 logging.getLogger(__name__).debug(f"Ship {self.name} cannot buy more cargo, out of gold.")
                 break
 
@@ -392,40 +541,46 @@ class Ship:
             amount_to_buy_in_tons = int(
                 min(
                     remaining_cargo_hold_in_tons,
-                    min(self.gold, max_price_for_sale_in_gold) / price_in_gold_per_ton,
+                    min(self._gold, max_price_for_sale_in_gold) / price_in_gold_per_ton,
                 ),
             )
-            self.cargo[resource] += amount_to_buy_in_tons
-            self.gold -= amount_to_buy_in_tons * price_in_gold_per_ton
+            self._cargo[resource] += amount_to_buy_in_tons
+            self._gold -= amount_to_buy_in_tons * price_in_gold_per_ton
 
-    def arrive_home(self) -> None:
+    def _arrive_home(self) -> None:
         """Handle the arrival of the ship back at its home city."""
-        self.start.gold += self.gold
+        self._start.gold += self._gold
         for resource in ResourceName:
-            self.start[resource] += self.cargo[resource]
+            self._start[resource] += self._cargo[resource]
         self.clear_cargo()
 
         # Nothing to pay for - we are the owner.
-        paid_information_price_in_gold = self.start.buy_city_info(self.destination_info)
-        self.start.gold += paid_information_price_in_gold
+        paid_information_price_in_gold = self._start.buy_city_info(self.destination_info)
+        self._start.gold += paid_information_price_in_gold
 
-    def arrive_at_destination(self) -> None:
+    def _arrive_at_destination(self) -> None:
         """Handle the arrival of the ship at its destination city."""
-        self.sell_cargo_at_destination()
+        self._sell_cargo_at_destination()
 
         # Buy cargo at destination with the best margin first
-        self.buy_cargo_at_destination()
+        self._buy_cargo_at_destination()
 
         # Update destination's price info with what ship observed at departure and earn some gold for it
-        self.gold += self.destination.buy_city_info(self.owner_info)
+        self._gold += self.destination.buy_city_info(self.owner_info)
 
         # Set up for return trip
         self.destination_info = copy(self.destination)
-        self._destination = self.start  # Return to owner city
+        self._destination = self._start  # Return to owner city
 
     def as_string(self) -> str:
         return (
-            f"{self.name} ({self.ship_spec.type.value}) from {self.start.name} to {self.destination.name}, "
-            f"carrying {', '.join(f'{amount}t {name.value}' for name, amount in self.cargo.items())} "
-            f"and {self.gold} gold."
+            f"{self.name} ({self.ship_spec.type.value}) from {self._start.name} to {self.destination.name}, "
+            f"carrying {', '.join(f'{amount}t {name.value}' for name, amount in self._cargo.items())} "
+            f"and {self._gold} gold."
         )
+
+    def step(self) -> None:
+        """Advance the ship's state by one iteration."""
+        self._travel()
+        self._handle_arrival()
+        self._depart()

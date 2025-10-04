@@ -13,7 +13,7 @@ from pirate_cities.resource import RESOURCE_PRICE_ELASTICITY
 from pirate_cities.resource import RESOURCE_PRICE_LIMITS
 
 from .config import DAYS_PER_ITERATION
-from .config import MAP_SIZE_IN_KM
+from .point2d import Point2d
 from .resource import ResourceName
 
 INITIAL_POPULATION_RANGE = (10, 1000)
@@ -146,12 +146,7 @@ CITY_NAMES = [
 @dataclass
 class City:
     name: str
-    location: tuple[float, float] = field(
-        default_factory=lambda: (
-            random.uniform(0, MAP_SIZE_IN_KM[0]),
-            random.uniform(0, MAP_SIZE_IN_KM[1]),
-        ),
-    )
+    location: Point2d
 
     base_population: int = field(
         default_factory=lambda: random.randint(*INITIAL_POPULATION_RANGE),
